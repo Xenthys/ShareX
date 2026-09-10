@@ -40,7 +40,14 @@ jobs:
     env:
       SOLUTION_FILE_PATH: ShareX.sln
       ASSEMBLY_INFO_PATH: Directory.build.props
+      # Update both upstream release-asset SHA256 values when changing version.
       FFMPEG_VERSION: "8.1"
+      FFMPEG_SHA256_X64: 1838932e32f01e0e7b65fde5ca0ebb2ab131cb6a9ff1a84025ee5b784075576c
+      FFMPEG_SHA256_ARM64: 7ac6c5dbbe61037bcce97482549294238d87400d8b7b1cb559949293c3b06dd5
+      SIGNING_ENABLED: ${{ github.event_name == 'push' && github.repository == 'ShareX/ShareX' && github.ref == 'refs/heads/test-signing' && matrix.configuration != 'Debug' && matrix.configuration != 'MicrosoftStoreDebug' }}
+      SIGNING_ENDPOINT: ${{ vars.SIGNING_ENDPOINT }}
+      SIGNING_ACCOUNT_NAME: ${{ vars.SIGNING_ACCOUNT_NAME }}
+      CERTIFICATE_PROFILE_NAME: ${{ vars.CERTIFICATE_PROFILE_NAME }}
 
     outputs:
       APP_VERSION: ${{ env.APP_VERSION }}
@@ -48,6 +55,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Test signed dependency cache helper
+        if: matrix.platform == 'x64' && matrix.configuration == 'Debug'
+        run: .github/scripts/SignedDependencies.Tests.ps1
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
@@ -58,7 +69,12 @@ jobs:
         run: |
           $platform = if ("${{ matrix.platform }}" -eq "ARM64") { "arm64" } else { "x64" }
           echo "PLATFORM=$platform" >> $env:GITHUB_ENV
+          $ffmpegHash = if ($platform -eq 'arm64') { $env:FFMPEG_SHA256_ARM64 } else { $env:FFMPEG_SHA256_X64 }
+          echo "FFMPEG_SHA256=$ffmpegHash" >> $env:GITHUB_ENV
+          echo "DEPENDENCY_CACHE=$env:RUNNER_TEMP\signed-dependencies" >> $env:GITHUB_ENV
+          echo "SIGNING_STAGE=$env:RUNNER_TEMP\dependency-signing" >> $env:GITHUB_ENV
           echo "RUNTIME_ID=win-$platform" >> $env:GITHUB_ENV
+          echo "BUILD_OUTPUT=$env:GITHUB_WORKSPACE\ShareX\bin\${{ matrix.configuration }}\win-$platform" >> $env:GITHUB_ENV
 
       - name: Set APP_VERSION
         run: |
@@ -93,22 +109,63 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration "${{ matrix.configuration }}" -p:Platform="${{ matrix.platform }}" --self-contained true /m:1 "${{ env.SOLUTION_FILE_PATH }}"
 
+      # Cache the original archive, never the output copy that is later signed.
+      - name: Restore FFmpeg download
+        id: ffmpeg-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}\ffmpeg-download
+          key: ffmpeg-download-v1-${{ runner.os }}-${{ env.FFMPEG_VERSION }}-${{ env.PLATFORM }}-${{ env.FFMPEG_SHA256 }}
+
       - name: Download FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
-          $archivePath = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
-          $extractPath = Join-Path $env:RUNNER_TEMP "ffmpeg"
+          New-Item "$env:RUNNER_TEMP\ffmpeg-download" -ItemType Directory -Force | Out-Null
           $downloadUrl = "https://github.com/ShareX/FFmpeg/releases/download/v${{ env.FFMPEG_VERSION }}/ffmpeg-${{ env.FFMPEG_VERSION }}-win-${{ env.PLATFORM }}.zip"
-          Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath
-          Expand-Archive -Path $archivePath -DestinationPath $extractPath -Force
-          $ffmpegPath = Get-ChildItem -Path $extractPath -Filter "ffmpeg.exe" -Recurse -File | Select-Object -First 1
-          if ($null -eq $ffmpegPath) {
-            throw "ffmpeg.exe was not found in the downloaded archive."
-          }
-          $destinationPath = "${{ github.workspace }}\ShareX\bin\${{ matrix.configuration }}\${{ env.RUNTIME_ID }}\ffmpeg.exe"
-          Copy-Item -LiteralPath $ffmpegPath.FullName -Destination $destinationPath -Force
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "$env:RUNNER_TEMP\ffmpeg-download\ffmpeg.zip"
+
+      - name: Extract FFmpeg into build output
+        run: |
+          $archiveHash = (Get-FileHash "$env:RUNNER_TEMP\ffmpeg-download\ffmpeg.zip" -Algorithm SHA256).Hash
+          if ($archiveHash -ne $env:FFMPEG_SHA256) { throw "FFmpeg archive SHA256 mismatch (download or cache)." }
+          $extractPath = Join-Path $env:RUNNER_TEMP "ffmpeg-extracted"
+          Expand-Archive -Path "$env:RUNNER_TEMP\ffmpeg-download\ffmpeg.zip" -DestinationPath $extractPath -Force
+          $ffmpegPaths = @(Get-ChildItem -Path $extractPath -Filter "ffmpeg.exe" -Recurse -File)
+          if ($ffmpegPaths.Count -ne 1) { throw "Expected exactly one ffmpeg.exe in the downloaded archive." }
+          Copy-Item -LiteralPath $ffmpegPaths[0].FullName -Destination "$env:BUILD_OUTPUT\ffmpeg.exe" -Force
+
+      - name: Save FFmpeg download
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}\ffmpeg-download
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+
+      - name: Calculate signed dependency cache key
+        id: dependency-key
+        if: env.SIGNING_ENABLED == 'true'
+        run: |
+          . .github/scripts/SignedDependencies.ps1
+          $policy = @('signed-dependencies-v1', $env:SIGNING_ENDPOINT, $env:SIGNING_ACCOUNT_NAME, $env:CERTIFICATE_PROFILE_NAME,
+            (Get-FileHash .github/scripts/SignedDependencies.ps1 -Algorithm SHA256).Hash) | ConvertTo-Json -Compress
+          $policyHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($policy)))
+          $inputs = ConvertTo-Json -InputObject @(Get-DependencyInventory $env:BUILD_OUTPUT) -Compress
+          $inputHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($inputs)))
+          $prefix = "signed-dependencies-v1-${{ runner.os }}-${{ matrix.platform }}-${{ matrix.configuration }}-$policyHash-"
+          "prefix=$prefix" >> $env:GITHUB_OUTPUT
+          "key=$prefix$inputHash" >> $env:GITHUB_OUTPUT
+
+      - name: Restore signed dependencies
+        id: dependency-cache
+        if: env.SIGNING_ENABLED == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.DEPENDENCY_CACHE }}
+          key: ${{ steps.dependency-key.outputs.key }}
+          restore-keys: ${{ steps.dependency-key.outputs.prefix }}
 
       - name: Azure login
-        if: github.ref == 'refs/heads/test-signing' && matrix.configuration != 'Debug' && matrix.configuration != 'MicrosoftStoreDebug'
+        if: env.SIGNING_ENABLED == 'true'
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -116,20 +173,59 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign ShareX binaries
-        if: github.ref == 'refs/heads/test-signing' && matrix.configuration != 'Debug' && matrix.configuration != 'MicrosoftStoreDebug'
+        if: env.SIGNING_ENABLED == 'true'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.CERTIFICATE_PROFILE_NAME }}
           files-folder: ${{ github.workspace }}\ShareX\bin\${{ matrix.configuration }}\${{ env.RUNTIME_ID }}
-          files-folder-filter: ShareX*.exe,ShareX*.dll,ffmpeg.exe
+          files-folder-filter: ShareX*.exe,ShareX*.dll
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      - name: Verify ShareX and stage dependency cache misses
+        id: dependency-stage
+        if: env.SIGNING_ENABLED == 'true'
+        run: |
+          . .github/scripts/SignedDependencies.ps1
+          $publisher = Assert-SignedFile "$env:BUILD_OUTPUT\ShareX.exe"
+          Get-ChildItem $env:BUILD_OUTPUT -File | Where-Object { $_.Name -like 'ShareX*' -and $_.Extension -in '.exe', '.dll' } | ForEach-Object {
+            $null = Assert-SignedFile $_.FullName $publisher
+          }
+          $count = Prepare-SignedDependencies $env:BUILD_OUTPUT $env:DEPENDENCY_CACHE $env:SIGNING_STAGE
+          "count=$count" >> $env:GITHUB_OUTPUT
+
+      - name: Sign changed dependencies
+        if: env.SIGNING_ENABLED == 'true' && steps.dependency-stage.outputs.count != '0'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ env.SIGNING_STAGE }}
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify and apply newly signed dependencies
+        if: env.SIGNING_ENABLED == 'true'
+        run: |
+          . .github/scripts/SignedDependencies.ps1
+          Complete-SignedDependencies $env:BUILD_OUTPUT $env:DEPENDENCY_CACHE $env:SIGNING_STAGE
+
+      - name: Save signed dependencies
+        if: env.SIGNING_ENABLED == 'true' && steps.dependency-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.DEPENDENCY_CACHE }}
+          key: ${{ steps.dependency-key.outputs.key }}
+
       - name: Sign Steam launcher
-        if: github.ref == 'refs/heads/test-signing' && matrix.configuration == 'Steam'
+        if: env.SIGNING_ENABLED == 'true' && matrix.configuration == 'Steam'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
@@ -139,6 +235,13 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Verify Steam launcher
+        if: env.SIGNING_ENABLED == 'true' && matrix.configuration == 'Steam'
+        run: |
+          . .github/scripts/SignedDependencies.ps1
+          $publisher = Assert-SignedFile "$env:BUILD_OUTPUT\ShareX.exe"
+          $null = Assert-SignedFile "$env:GITHUB_WORKSPACE\ShareX.Steam\bin\Steam\ShareX_Launcher.exe" $publisher
 
       - name: Build Setup (x64)
         if: matrix.platform == 'ARM64'
@@ -152,7 +255,7 @@ jobs:
           & "ShareX.Setup\bin\${{ matrix.configuration }}\win-x64\ShareX.Setup.exe" -silent -job "${{ matrix.configuration }}" -platform "${{ matrix.platform }}"
 
       - name: Sign setup
-        if: github.ref == 'refs/heads/test-signing' && matrix.configuration == 'Release'
+        if: env.SIGNING_ENABLED == 'true' && matrix.configuration == 'Release'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
@@ -162,6 +265,13 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Verify setup
+        if: env.SIGNING_ENABLED == 'true' && matrix.configuration == 'Release'
+        run: |
+          . .github/scripts/SignedDependencies.ps1
+          $publisher = Assert-SignedFile "$env:BUILD_OUTPUT\ShareX.exe"
+          $null = Assert-SignedFile "$env:GITHUB_WORKSPACE\Output\ShareX-$env:APP_VERSION-setup-$env:PLATFORM.exe" $publisher
 
       - name: Upload artifact (Setup-x64)
         if: matrix.configuration == 'Release' && matrix.platform == 'x64'
